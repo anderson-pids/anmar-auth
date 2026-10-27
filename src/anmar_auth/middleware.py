@@ -1,12 +1,14 @@
 import base64
+from collections.abc import Mapping
 from typing import Optional
 from urllib.parse import quote
+from uuid import UUID
 
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse
 
 from anmar_auth.exceptions import TokenInvalidError
 from anmar_auth.jwks_cache import JWKSCache
@@ -24,17 +26,31 @@ def _jwk_to_pubkey(jwk: dict):
 
 
 class AnmarAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, jwks_url: str, issuer: str, cookie_name: str = "anmar_session", jwks_ttl: int = 3600):
+    def __init__(
+        self, app, jwks_url: str, issuer: str,
+        cookie_name: str = "anmar_session", jwks_ttl: int = 3600,
+        integration_audience: str | None = None,
+        integration_routes: Mapping[tuple[str, str], str] | None = None,
+    ):
         super().__init__(app)
         self._cache = JWKSCache(jwks_url, ttl=jwks_ttl)
         self._issuer = issuer
         self._cookie_name = cookie_name
+        self._integration_audience = integration_audience
+        self._integration_routes = dict(integration_routes or {})
 
     async def dispatch(self, request: Request, call_next):
         token = self._extract_token(request)
         if token:
             try:
                 claims = await self._verify(token)
+                if claims.get("token_use") == "integration":
+                    auth = request.headers.get("authorization", "")
+                    if not auth.lower().startswith("bearer "):
+                        raise TokenInvalidError("integração exige Bearer")
+                    permission = self._integration_routes.get((request.method, request.url.path))
+                    if permission is None or permission not in claims["permissions"]:
+                        return JSONResponse({"detail": "acesso negado"}, status_code=403)
                 request.state.user = claims
             except TokenInvalidError:
                 request.state.user = None
@@ -62,9 +78,57 @@ class AnmarAuthMiddleware(BaseHTTPMiddleware):
 
         pubkey = _jwk_to_pubkey(jwk)
         try:
-            return pyjwt.decode(token, pubkey, algorithms=["RS256"], issuer=self._issuer)
-        except pyjwt.PyJWTError as exc:
+            try:
+                claims = pyjwt.decode(token, pubkey, algorithms=["RS256"], issuer=self._issuer)
+            except pyjwt.InvalidAudienceError:
+                if not self._integration_audience:
+                    raise
+                claims = pyjwt.decode(
+                    token, pubkey, algorithms=["RS256"], issuer=self._issuer,
+                    audience=self._integration_audience,
+                    options={
+                        "strict_aud": True,
+                        "require": ["iss", "aud", "sub", "token_use", "role", "fazenda",
+                                    "permissions", "scope", "iat", "exp", "jti"],
+                    },
+                )
+                self._validate_integration_claims(claims)
+                return claims
+            # An integration without aud must never become a legacy human session.
+            if claims.get("token_use") == "integration" or claims.get("role") == "integration":
+                raise TokenInvalidError("integração exige audience")
+            return claims
+        except (pyjwt.PyJWTError, TypeError) as exc:
+            # PyJWT 2.9 raises TypeError for malformed numeric date claims.
             raise TokenInvalidError(str(exc)) from exc
+
+    @staticmethod
+    def _validate_integration_claims(claims: dict) -> None:
+        if claims["token_use"] != "integration" or claims["role"] != "integration":
+            raise TokenInvalidError("tipo de token inválido")
+        try:
+            UUID(claims["sub"])
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise TokenInvalidError("sub de integração inválido") from exc
+        if claims["fazenda"] not in ("serra-branca", "renascer"):
+            raise TokenInvalidError("fazenda de integração inválida")
+        permissions = claims["permissions"]
+        if (
+            not isinstance(permissions, list) or not permissions
+            or any(not isinstance(p, str) or not p or any(c.isspace() for c in p) for p in permissions)
+            or len(set(permissions)) != len(permissions)
+        ):
+            raise TokenInvalidError("permissões de integração inválidas")
+        scope = claims["scope"]
+        if not isinstance(scope, str) or scope != " ".join(permissions):
+            raise TokenInvalidError("scope incompatível com permissões")
+        if (
+            type(claims["iat"]) is not int or type(claims["exp"]) is not int
+            or not 0 < claims["exp"] - claims["iat"] <= 300
+        ):
+            raise TokenInvalidError("validade de integração inválida")
+        if not isinstance(claims["jti"], str) or not claims["jti"].strip():
+            raise TokenInvalidError("jti de integração inválido")
 
 
 def _wants_html(request: Request) -> bool:
